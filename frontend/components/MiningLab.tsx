@@ -3,10 +3,11 @@
 import {useState} from 'react';
 import Link from 'next/link';
 import {useQuery} from '@tanstack/react-query';
+import {useAccount} from 'wagmi';
 import {formatUnits, parseAbi} from 'viem';
-import {ArrowRight, ArrowUpRight, CircleHelp, RotateCcw, Zap} from 'lucide-react';
+import {ArrowRight, ArrowUpRight, CircleHelp, RotateCcw, RefreshCw, Zap} from 'lucide-react';
 import AppShell from './AppShell';
-import {client, CORE, MINING, explorer} from '../lib/chain';
+import {client, CORE, MINING, STAKING, stakingAbi, explorer} from '../lib/chain';
 import {PUBLISHED_SCHEDULE, simulateMining, type IssuanceSchedule} from '../lib/mining-model';
 import './mining-lab.css';
 
@@ -22,18 +23,21 @@ const sqk = (base: bigint) => Number(formatUnits(base, 18)).toLocaleString('en-U
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, Number.isFinite(value) ? Math.floor(value) : min));
 
 export default function MiningLab() {
+  const {address} = useAccount();
   const [work, setWork] = useState(80);
   const [rounds, setRounds] = useState(12);
   const [manualDifficulty, setManualDifficulty] = useState(10875);
   const [useLive, setUseLive] = useState(true);
-  const live = useQuery({queryKey: ['mining-lab-sepolia-v1'], refetchInterval: 60_000, queryFn: async () => {
+  const live = useQuery({queryKey: ['mining-lab-sepolia-v2', address], refetchInterval: 60_000, queryFn: async () => {
     const block = await client.getBlockNumber();
-    const [core, mining, schedule] = await Promise.all([
+    const [core, mining, schedule, rewards, claimable] = await Promise.all([
       client.readContract({address: CORE, abi: coreAbi, functionName: 'state', blockNumber: block}),
       client.readContract({address: MINING, abi: miningAbi, functionName: 'state', blockNumber: block}),
       client.readContract({address: MINING, abi: miningAbi, functionName: 'issuanceSchedule', blockNumber: block}),
+      client.readContract({address: STAKING, abi: stakingAbi, functionName: 'rewardState', blockNumber: block}),
+      address ? client.readContract({address: STAKING, abi: stakingAbi, functionName: 'claimable', args: [address], blockNumber: block}) : Promise.resolve(null),
     ]);
-    return {block, core, mining, schedule};
+    return {block, core, mining, schedule, rewards, claimable};
   }});
   const sourced = useLive && !!live.data;
   const schedule: IssuanceSchedule = sourced ? live.data!.schedule : PUBLISHED_SCHEDULE;
@@ -49,8 +53,14 @@ export default function MiningLab() {
   const maxBlocks = Math.max(1, ...result.history.map(row => Number(row.blocks)));
   const samples = result.history.length <= 24 ? result.history : result.history.filter((_, i) => i % Math.ceil(result.history.length / 24) === 0 || i === result.history.length - 1);
   const runState = mining?.active ? 'MINING ACTIVE' : sourced ? 'REWARDS NOT ACTIVE' : 'PUBLISHED TESTNET VALUES';
+  const snapshot = live.data;
+  const lag = snapshot && snapshot.mining.startCaptured && snapshot.core.settledThroughRound > snapshot.mining.processedThroughRound
+    ? snapshot.core.settledThroughRound - snapshot.mining.processedThroughRound : 0n;
   return <AppShell active="mining">
     <header className="mining-head"><div><span className="eyebrow">VEILHUB / MINING LAB</span><h1>What if the <em>wheel turns?</em></h1><p>Explore how measured work becomes Squeek blocks and how those blocks may fund SQK staking. The model follows Squeekchain’s integer rules; your inputs describe a hypothetical future.</p></div><div className="mining-status"><span className="pixel-live"/> {runState}<small>{sourced ? `Sepolia snapshot · ETH block ${fmt(live.data!.block)}` : live.isPending ? 'Reading Sepolia…' : 'On-chain read unavailable · using published revision 7 values'}</small></div></header>
+    <section className="mining-pipeline" aria-label="Live Squeekchain pipeline"><div className="mining-pipeline-heading"><div><span className="eyebrow">LIVE / SEPOLIA</span><h2>From wheel record to staking</h2><p>One Ethereum block snapshot. These totals are recorded by the official contracts; the scenario below is separate.</p></div><button onClick={() => live.refetch()} disabled={live.isFetching}><RefreshCw size={15} className={live.isFetching ? 'mining-refreshing' : ''}/> Refresh <span>{snapshot ? `#${fmt(snapshot.block)}` : 'RPC'}</span></button></div>
+      {snapshot ? <><div className="mining-pipeline-steps"><div><span className="mining-step-number">01 / CORE</span><small>SETTLED WORK</small><strong>{fmt(snapshot.core.cumulativeWork)}</strong><p>Accepted passages settled through round {fmt(snapshot.core.settledThroughRound)}.</p></div><div><span className="mining-step-number">02 / CORE</span><small>SQUEEK BLOCKS</small><strong>{fmt(snapshot.core.blockHeight)}</strong><p>{(Number(snapshot.core.blockProgress) / 10_000_000).toFixed(1)}% toward the next block.</p></div><div><span className="mining-step-number">03 / MINING</span><small>FUNDED BLOCKS</small><strong>{fmt(snapshot.mining.fundedBlocks)}</strong><p>{snapshot.mining.startCaptured ? `${fmt(lag)} certified rounds past the checkpoint cursor.` : 'Start height has not been captured yet.'}</p></div><div><span className="mining-step-number">04 / STAKING</span><small>SQK FUNDED</small><strong>{sqk(snapshot.rewards.funded)}</strong><p>Mining issued {sqk(snapshot.mining.minted)} SQK since reward start.</p></div></div><div className="mining-pipeline-foot"><span>Core work and blocks include history before SQK rewards started. Funded blocks and SQK begin at Mining’s start height. A checkpoint can advance with zero new SQK.</span>{address&&<span><b>YOUR CLAIMABLE STAKING SQK</b> {snapshot.claimable===null?'—':sqk(snapshot.claimable)}</span>}</div></> : <div className="mining-pipeline-empty" role={live.isError?'alert':'status'}>{live.isPending?'Reading official Sepolia contracts…':'On-chain data is unavailable right now. The scenario below still works with published testnet parameters.'}</div>}
+    </section>
     <div className="mining-layout"><section className="mining-console" aria-label="Mining scenario controls">
       <div className="mining-panel-top"><span>01 / SCENARIO ENGINE</span><button onClick={() => {setWork(80);setRounds(12);setManualDifficulty(10875);setUseLive(true)}}><RotateCcw size={14}/> Reset</button></div>
       <div className="mining-wheel-scene"><div className="mining-wheel" style={{animationDuration: `${Math.max(.8, 8 - work / 160)}s`}}><span>✦</span><i/><i/><i/><i/></div><div className="mining-scene-label"><b>WHEELY9000</b><span>ROUND INPUT / ESTIMATE</span></div><div className="mining-pulse"><Zap size={15}/> {fmt(work)} accepted passages</div></div>
